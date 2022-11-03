@@ -36,9 +36,10 @@ import (
 
 type NetConf struct {
 	types.NetConf
-	Master string `json:"master"`
-	Mode   string `json:"mode"`
-	MTU    int    `json:"mtu"`
+	Master     string `json:"master"`
+	Mode       string `json:"mode"`
+	MTU        int    `json:"mtu"`
+	LinkContNs bool   `json:"linkInContainer"`
 }
 
 func init() {
@@ -48,9 +49,9 @@ func init() {
 	runtime.LockOSThread()
 }
 
-func loadConf(bytes []byte, cmdCheck bool) (*NetConf, string, error) {
+func loadConf(args *skel.CmdArgs, cmdCheck bool) (*NetConf, string, error) {
 	n := &NetConf{}
-	if err := json.Unmarshal(bytes, n); err != nil {
+	if err := json.Unmarshal(args.StdinData, n); err != nil {
 		return nil, "", fmt.Errorf("failed to load netconf: %v", err)
 	}
 
@@ -73,20 +74,41 @@ func loadConf(bytes []byte, cmdCheck bool) (*NetConf, string, error) {
 	}
 	if n.Master == "" {
 		if result == nil {
-			defaultRouteInterface, err := getDefaultRouteInterfaceName()
+			if n.LinkContNs {
+				netns, err := ns.GetNS(args.Netns)
+				if err != nil {
+					return nil, "", fmt.Errorf("failed to open netns %q: %v", netns, err)
+				}
+				defer netns.Close()
 
-			if err != nil {
-				return nil, "", err
-			}
-			n.Master = defaultRouteInterface
-		} else {
-			if len(result.Interfaces) == 1 && result.Interfaces[0].Name != "" {
-				n.Master = result.Interfaces[0].Name
+				err = netns.Do(func(_ ns.NetNS) error {
+					defaultRouteInterface, err := getDefaultRouteInterfaceName()
+					if err != nil {
+						return err
+					}
+					n.Master = defaultRouteInterface
+					return nil
+				})
+				if err != nil {
+					return nil, "", err
+				}
+
 			} else {
-				return nil, "", fmt.Errorf("chained master failure. PrevResult lacks a single named interface")
+				defaultRouteInterface, err := getDefaultRouteInterfaceName()
+				if err != nil {
+					return nil, "", err
+				}
+				n.Master = defaultRouteInterface
 			}
 		}
+	} else {
+		if len(result.Interfaces) == 1 && result.Interfaces[0].Name != "" {
+			n.Master = result.Interfaces[0].Name
+		} else {
+			return nil, "", fmt.Errorf("chained master failure. PrevResult lacks a single named interface")
+		}
 	}
+
 	return n, n.CNIVersion, nil
 }
 
@@ -124,7 +146,16 @@ func createIpvlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interf
 		return nil, err
 	}
 
-	m, err := netlink.LinkByName(conf.Master)
+	var m netlink.Link
+	if conf.LinkContNs {
+		err = netns.Do(func(_ ns.NetNS) error {
+			m, err = netlink.LinkByName(conf.Master)
+			return err
+		})
+	} else {
+		m, err = netlink.LinkByName(conf.Master)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup master %q: %v", conf.Master, err)
 	}
@@ -194,7 +225,7 @@ func getDefaultRouteInterfaceName() (string, error) {
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	n, cniVersion, err := loadConf(args.StdinData, false)
+	n, cniVersion, err := loadConf(args, false)
 	if err != nil {
 		return err
 	}
@@ -272,7 +303,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	n, _, err := loadConf(args.StdinData, false)
+	n, _, err := loadConf(args, false)
 	if err != nil {
 		return err
 	}
@@ -319,8 +350,7 @@ func main() {
 }
 
 func cmdCheck(args *skel.CmdArgs) error {
-
-	n, _, err := loadConf(args.StdinData, true)
+	n, _, err := loadConf(args, true)
 	if err != nil {
 		return err
 	}
@@ -369,6 +399,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 			contMap.Sandbox, args.Netns)
 	}
 
+	// TODO: change this to support the in container
 	m, err := netlink.LinkByName(n.Master)
 	if err != nil {
 		return fmt.Errorf("failed to lookup master %q: %v", n.Master, err)

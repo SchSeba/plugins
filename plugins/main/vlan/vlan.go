@@ -20,12 +20,11 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/vishvananda/netlink"
-
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/vishvananda/netlink"
 
 	"github.com/containernetworking/plugins/pkg/ip"
 	"github.com/containernetworking/plugins/pkg/ipam"
@@ -35,9 +34,10 @@ import (
 
 type NetConf struct {
 	types.NetConf
-	Master string `json:"master"`
-	VlanId int    `json:"vlanId"`
-	MTU    int    `json:"mtu,omitempty"`
+	Master     string `json:"master"`
+	VlanId     int    `json:"vlanId"`
+	MTU        int    `json:"mtu,omitempty"`
+	LinkContNs bool   `json:"linkInContainer"`
 }
 
 func init() {
@@ -47,9 +47,9 @@ func init() {
 	runtime.LockOSThread()
 }
 
-func loadConf(bytes []byte) (*NetConf, string, error) {
+func loadConf(args *skel.CmdArgs) (*NetConf, string, error) {
 	n := &NetConf{}
-	if err := json.Unmarshal(bytes, n); err != nil {
+	if err := json.Unmarshal(args.StdinData, n); err != nil {
 		return nil, "", fmt.Errorf("failed to load netconf: %v", err)
 	}
 	if n.Master == "" {
@@ -60,7 +60,25 @@ func loadConf(bytes []byte) (*NetConf, string, error) {
 	}
 
 	// check existing and MTU of master interface
-	masterMTU, err := getMTUByName(n.Master)
+	var err error
+	masterMTU := 0
+	if n.LinkContNs {
+		netns, err := ns.GetNS(args.Netns)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to open netns %q: %v", netns, err)
+		}
+		defer netns.Close()
+
+		err = netns.Do(func(_ ns.NetNS) error {
+			masterMTU, err = getMTUByName(n.Master)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+	} else {
+		masterMTU, err = getMTUByName(n.Master)
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -82,7 +100,17 @@ func getMTUByName(ifName string) (int, error) {
 func createVlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interface, error) {
 	vlan := &current.Interface{}
 
-	m, err := netlink.LinkByName(conf.Master)
+	var m netlink.Link
+	var err error
+	if conf.LinkContNs {
+		err = netns.Do(func(_ ns.NetNS) error {
+			m, err = netlink.LinkByName(conf.Master)
+			return err
+		})
+	} else {
+		m, err = netlink.LinkByName(conf.Master)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup master %q: %v", conf.Master, err)
 	}
@@ -104,7 +132,14 @@ func createVlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interfac
 		VlanId: conf.VlanId,
 	}
 
-	if err := netlink.LinkAdd(v); err != nil {
+	if conf.LinkContNs {
+		err = netns.Do(func(_ ns.NetNS) error {
+			return netlink.LinkAdd(v)
+		})
+	} else {
+		err = netlink.LinkAdd(v)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("failed to create vlan: %v", err)
 	}
 
@@ -133,7 +168,7 @@ func createVlan(conf *NetConf, ifName string, netns ns.NetNS) (*current.Interfac
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	n, cniVersion, err := loadConf(args.StdinData)
+	n, cniVersion, err := loadConf(args)
 	if err != nil {
 		return err
 	}
@@ -191,7 +226,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	n, _, err := loadConf(args.StdinData)
+	n, _, err := loadConf(args)
 	if err != nil {
 		return err
 	}
